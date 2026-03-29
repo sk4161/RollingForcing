@@ -78,7 +78,7 @@ def _load_pipeline(config_path: str, checkpoint_path: Optional[str], use_ema: bo
 def build_predict(config_path: str, checkpoint_path: Optional[str], output_dir: str, use_ema: bool):
     os.makedirs(output_dir, exist_ok=True)
 
-    def predict(prompt: str, num_frames: int) -> str:
+    def predict(prompt: str, num_frames: int, seed: int) -> str:
         if not prompt or not prompt.strip():
             raise gr.Error("Please enter a non-empty text prompt.")
 
@@ -89,6 +89,8 @@ def build_predict(config_path: str, checkpoint_path: Optional[str], output_dir: 
         pipeline = _load_pipeline(config_path, checkpoint_path, use_ema)
 
         # Prepare inputs
+        seed = int(seed)
+        torch.manual_seed(seed)
         prompts = [prompt.strip()]
         noise = torch.randn([1, num_frames, 16, 60, 104], device=_DEVICE, dtype=torch.bfloat16)
 
@@ -141,6 +143,7 @@ def main():
         inputs=[
             gr.Textbox(label="Text Prompt", lines=2, placeholder="A cinematic shot of a girl dancing in the sunset."),
             gr.Slider(label="Number of Latent Frames", minimum=21, maximum=252, step=3, value=21),
+            gr.Number(label="Seed", value=42, precision=0),
         ],
         outputs=gr.Video(label="Generated Video", format="mp4"),
         title="Rolling Forcing: Autoregressive Long Video Diffusion in Real Time",
