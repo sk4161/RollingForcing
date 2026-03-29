@@ -48,7 +48,7 @@ class CausalInferencePipeline(torch.nn.Module):
         text_prompts: List[str],
         initial_latent: Optional[torch.Tensor] = None,
         return_latents: bool = False,
-        profile: bool = False
+        profile: bool = False,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -125,6 +125,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
 
         # Step 2: Cache context feature
+        current_start_frame = 0
         if initial_latent is not None:
             timestep = torch.ones([batch_size, 1], device=noise.device, dtype=torch.int64) * 0
             if self.independent_first_frame:
@@ -196,6 +197,9 @@ class CausalInferencePipeline(torch.nn.Module):
             shared_timestep[:, index * self.num_frame_per_block:(index + 1) * self.num_frame_per_block] *= current_timestep
 
 
+        # Offset for initial_latent frames already placed in output/noisy_cache
+        frame_offset = num_input_frames
+
         # Denoising loop with rolling forcing
         for window_index in range(window_num):
 
@@ -207,25 +211,30 @@ class CausalInferencePipeline(torch.nn.Module):
             end_block = window_end_blocks[window_index] # include
             print(f"start_block: {start_block}, end_block: {end_block}")
 
-            current_start_frame = start_block * self.num_frame_per_block
-            current_end_frame = (end_block + 1) * self.num_frame_per_block # not include
-            current_num_frames = current_end_frame - current_start_frame
+            # Indices into the noise tensor (0-based)
+            noise_start_frame = start_block * self.num_frame_per_block
+            noise_end_frame = (end_block + 1) * self.num_frame_per_block # not include
+            current_num_frames = noise_end_frame - noise_start_frame
+
+            # Indices into output/noisy_cache (offset by initial_latent frames)
+            out_start_frame = frame_offset + noise_start_frame
+            out_end_frame = frame_offset + noise_end_frame
 
             # noisy_input: new noise and previous denoised noisy frames, only last block is pure noise
-            if current_num_frames == rolling_window_length_blocks * self.num_frame_per_block or current_start_frame == 0:
+            if current_num_frames == rolling_window_length_blocks * self.num_frame_per_block or noise_start_frame == 0:
                 noisy_input = torch.cat([
-                    noisy_cache[:, current_start_frame : current_end_frame - self.num_frame_per_block],
-                    noise[:, current_end_frame - self.num_frame_per_block : current_end_frame ]
+                    noisy_cache[:, out_start_frame : out_end_frame - self.num_frame_per_block],
+                    noise[:, noise_end_frame - self.num_frame_per_block : noise_end_frame]
                 ], dim=1)
             else: # at the end of the video
-                noisy_input = noisy_cache[:, current_start_frame:current_end_frame]
+                noisy_input = noisy_cache[:, out_start_frame:out_end_frame]
 
             # init denosing timestep
             if current_num_frames == rolling_window_length_blocks * self.num_frame_per_block:
                 current_timestep = shared_timestep
-            elif current_start_frame == 0:
+            elif noise_start_frame == 0:
                 current_timestep = shared_timestep[:,-current_num_frames:]
-            elif current_end_frame == num_frames:
+            elif noise_end_frame == num_frames:
                 current_timestep = shared_timestep[:,:current_num_frames]
             else:
                 raise ValueError("current_num_frames should be equal to rolling_window_length_blocks * self.num_frame_per_block, or the first or last window.")
@@ -238,18 +247,18 @@ class CausalInferencePipeline(torch.nn.Module):
                     timestep=current_timestep,
                     kv_cache=self.kv_cache_clean,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length
+                    current_start=out_start_frame * self.frame_seq_length
                 )
 
-            output[:, current_start_frame:current_end_frame] = denoised_pred
-                
+            output[:, out_start_frame:out_end_frame] = denoised_pred
+
 
             # update noisy_cache, which is detached from the computation graph
             with torch.no_grad():
                 for block_idx in range(start_block, end_block + 1):
-                    
-                    block_time_step = current_timestep[:, 
-                                    (block_idx - start_block)*self.num_frame_per_block : 
+
+                    block_time_step = current_timestep[:,
+                                    (block_idx - start_block)*self.num_frame_per_block :
                                     (block_idx - start_block+1)*self.num_frame_per_block].mean().item()
                     matches = torch.abs(self.denoising_step_list - block_time_step) < 1e-4
                     block_timestep_index = torch.nonzero(matches, as_tuple=True)[0]
@@ -259,8 +268,9 @@ class CausalInferencePipeline(torch.nn.Module):
 
                     next_timestep = self.denoising_step_list[block_timestep_index + 1].to(noise.device)
 
-                    noisy_cache[:, block_idx * self.num_frame_per_block:
-                                    (block_idx+1) * self.num_frame_per_block] = \
+                    out_block_start = frame_offset + block_idx * self.num_frame_per_block
+                    out_block_end = frame_offset + (block_idx + 1) * self.num_frame_per_block
+                    noisy_cache[:, out_block_start:out_block_end] = \
                         self.scheduler.add_noise(
                             denoised_pred.flatten(0, 1),
                             torch.randn_like(denoised_pred.flatten(0, 1)),
@@ -290,7 +300,7 @@ class CausalInferencePipeline(torch.nn.Module):
                     timestep=context_timestep,
                     kv_cache=self.kv_cache_clean,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length,
+                    current_start=out_start_frame * self.frame_seq_length,
                     updating_cache=True,
                 )
 

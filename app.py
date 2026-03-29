@@ -78,7 +78,7 @@ def _load_pipeline(config_path: str, checkpoint_path: Optional[str], use_ema: bo
 def build_predict(config_path: str, checkpoint_path: Optional[str], output_dir: str, use_ema: bool):
     os.makedirs(output_dir, exist_ok=True)
 
-    def predict(prompt: str, num_frames: int, seed: int) -> str:
+    def predict(prompt: str, num_frames: int, first_frame_seed: int, motion_seed: int) -> str:
         if not prompt or not prompt.strip():
             raise gr.Error("Please enter a non-empty text prompt.")
 
@@ -89,18 +89,38 @@ def build_predict(config_path: str, checkpoint_path: Optional[str], output_dir: 
         pipeline = _load_pipeline(config_path, checkpoint_path, use_ema)
 
         # Prepare inputs
-        seed = int(seed)
-        torch.manual_seed(seed)
         prompts = [prompt.strip()]
-        noise = torch.randn([1, num_frames, 16, 60, 104], device=_DEVICE, dtype=torch.bfloat16)
+        first_frame_seed = int(first_frame_seed)
+        motion_seed = int(motion_seed)
+        num_frame_per_block = 3
 
         torch.set_grad_enabled(False)
         with torch.inference_mode(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            # Pass 1: generate minimum frames needed to fully denoise the first block
+            # Need at least rolling_window_length_blocks (=num_denoising_steps) blocks
+            min_frames_pass1 = len(pipeline.denoising_step_list) * num_frame_per_block
+            torch.manual_seed(first_frame_seed)
+            torch.cuda.manual_seed(first_frame_seed)
+            noise1 = torch.randn([1, min_frames_pass1, 16, 60, 104], device=_DEVICE, dtype=torch.bfloat16)
+            _, latents1 = pipeline.inference_rolling_forcing(
+                noise=noise1,
+                text_prompts=prompts,
+                return_latents=True,
+                initial_latent=None,
+            )
+            first_block_latent = latents1[:, :num_frame_per_block].clone()
+
+            # Pass 2: use the first block as initial_latent, generate the rest with motion_seed
+            torch.manual_seed(motion_seed)
+            torch.cuda.manual_seed(motion_seed)
+            remaining_frames = num_frames - num_frame_per_block
+            noise2 = torch.randn([1, remaining_frames, 16, 60, 104], device=_DEVICE, dtype=torch.bfloat16)
+
             video = pipeline.inference_rolling_forcing(
-                noise=noise,
+                noise=noise2,
                 text_prompts=prompts,
                 return_latents=False,
-                initial_latent=None,
+                initial_latent=first_block_latent,
             )
 
         # video: [B=1, T, C, H, W] in [0,1]
@@ -143,7 +163,8 @@ def main():
         inputs=[
             gr.Textbox(label="Text Prompt", lines=2, placeholder="A cinematic shot of a girl dancing in the sunset."),
             gr.Slider(label="Number of Latent Frames", minimum=21, maximum=252, step=3, value=21),
-            gr.Number(label="Seed", value=42, precision=0),
+            gr.Number(label="First Frame Seed", value=42, precision=0),
+            gr.Number(label="Motion Seed", value=0, precision=0),
         ],
         outputs=gr.Video(label="Generated Video", format="mp4"),
         title="Rolling Forcing: Autoregressive Long Video Diffusion in Real Time",
