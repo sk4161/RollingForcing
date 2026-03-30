@@ -6,3 +6,5 @@ wan_models
 checkpoints
 videos
 logs
+
+saved_videos/
