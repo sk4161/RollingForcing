@@ -134,64 +134,45 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     elif isinstance(batch_data, list):
         batch = batch_data[0]  # First (and only) item in the batch
 
-    all_video = []
-    num_generated_frames = 0  # Number of generated (latent) frames
-
     if args.i2v:
-        # For image-to-video, batch contains image and caption
-        prompt = batch['prompts'][0]  # Get caption from batch
-        prompts = [prompt] * args.num_samples
-
-        # Process the image
+        prompt = batch['prompts'][0]
         image = batch['image'].squeeze(0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.bfloat16)
-
-        # Encode the input image as the first latent
         initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
-        initial_latent = initial_latent.repeat(args.num_samples, 1, 1, 1, 1)
-
-        sampled_noise = torch.randn(
-            [args.num_samples, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
-        )
+        noise_frames = args.num_output_frames - 1
     else:
-        # For text-to-video, batch is just the text prompt
         prompt = batch['prompts'][0]
         extended_prompt = batch['extended_prompts'][0] if 'extended_prompts' in batch else None
-        if extended_prompt is not None:
-            prompts = [extended_prompt] * args.num_samples
-        else:
-            prompts = [prompt] * args.num_samples
+        prompt = extended_prompt if extended_prompt is not None else prompt
         initial_latent = None
+        noise_frames = args.num_output_frames
+
+    model = "regular" if not args.use_ema else "ema"
+
+    for seed_idx in range(args.num_samples):
+        current_seed = args.seed + seed_idx
+        set_seed(current_seed)
 
         sampled_noise = torch.randn(
-            [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
+            [1, noise_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
         )
+        current_initial_latent = initial_latent
 
-    # Generate 81 frames
-    video, latents = pipeline.inference_rolling_forcing(
-        noise=sampled_noise,
-        text_prompts=prompts,
-        return_latents=True,
-        initial_latent=initial_latent,
-    )
-    current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
-    all_video.append(current_video)
-    num_generated_frames += latents.shape[1]
+        video, latents = pipeline.inference_rolling_forcing(
+            noise=sampled_noise,
+            text_prompts=[prompt],
+            return_latents=True,
+            initial_latent=current_initial_latent,
+        )
+        current_video = rearrange(video, 'b t c h w -> b t h w c')[0].cpu()
+        video_uint8 = (255.0 * current_video).clamp(0, 255).to(torch.uint8)
 
-    # Final output video
-    video = 255.0 * torch.cat(all_video, dim=1)
+        pipeline.vae.model.clear_cache()
 
-    # Clear VAE cache
-    pipeline.vae.model.clear_cache()
-
-    # Save the video if the current prompt is not a dummy prompt
-    if idx < num_prompts:
-        model = "regular" if not args.use_ema else "ema"
-        for seed_idx in range(args.num_samples):
-            # All processes save their videos
+        if idx < num_prompts:
             if args.save_with_index:
                 output_path = os.path.join(args.output_folder, f'{idx}-{seed_idx}_{model}.mp4')
             else:
                 output_path = os.path.join(args.output_folder, f'{prompt[:100]}-{seed_idx}.mp4')
-            write_video(output_path, video[seed_idx], fps=16)
-            # imageio.mimwrite(output_path, video[seed_idx], fps=16, quality=8, output_params=["-loglevel", "error"])
+            write_video(output_path, video_uint8, fps=16)
+            print(f"Saved {output_path} (seed={current_seed})")
     
